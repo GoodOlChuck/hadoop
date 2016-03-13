@@ -41,6 +41,7 @@ import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.TokenIdentifier;
+import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.FailApplicationAttemptRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportRequest;
@@ -96,6 +97,7 @@ import org.apache.hadoop.yarn.api.records.NodeReport;
 import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
+import org.apache.hadoop.yarn.api.records.QueueStatistics;
 import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
 import org.apache.hadoop.yarn.api.records.SignalContainerCommand;
 import org.apache.hadoop.yarn.api.records.Token;
@@ -107,6 +109,8 @@ import org.apache.hadoop.yarn.client.api.TimelineClient;
 import org.apache.hadoop.yarn.client.api.YarnClient;
 import org.apache.hadoop.yarn.client.api.YarnClientApplication;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.event.ClusterPressureEvent;
+import org.apache.hadoop.yarn.event.ClusterPressureEventType;
 import org.apache.hadoop.yarn.exceptions.ApplicationIdNotProvidedException;
 import org.apache.hadoop.yarn.exceptions.ApplicationNotFoundException;
 import org.apache.hadoop.yarn.exceptions.ContainerNotFoundException;
@@ -124,7 +128,7 @@ import com.google.common.annotations.VisibleForTesting;
 @Unstable
 public class YarnClientImpl extends YarnClient {
 
-  private static final Log LOG = LogFactory.getLog(YarnClientImpl.class);
+  protected static final Log LOG = LogFactory.getLog(YarnClientImpl.class);
 
   protected ApplicationClientProtocol rmClient;
   protected long submitPollIntervalMillis;
@@ -139,6 +143,8 @@ public class YarnClientImpl extends YarnClient {
   String timelineDTRenewer;
   protected boolean timelineServiceEnabled;
   protected boolean timelineServiceBestEffort;
+  private ClusterPressureMonitor clusterPressureMonitor;
+  private ClusterPressureEvent clusterPressureEventStatus = null;
 
   private static final String ROOT = "root";
 
@@ -194,12 +200,14 @@ public class YarnClientImpl extends YarnClient {
     try {
       rmClient = ClientRMProxy.createRMProxy(getConfig(),
           ApplicationClientProtocol.class);
+      clusterPressureMonitor = new ClusterPressureMonitor(this, rmClient);
       if (historyServiceEnabled) {
         historyClient.start();
       }
       if (timelineServiceEnabled) {
         timelineClient.start();
       }
+  	  clusterPressureMonitor.serviceStart();
     } catch (IOException e) {
       throw new YarnRuntimeException(e);
     }
@@ -217,6 +225,7 @@ public class YarnClientImpl extends YarnClient {
     if (timelineServiceEnabled) {
       timelineClient.stop();
     }
+    clusterPressureMonitor.serviceStop();
     super.serviceStop();
   }
 
@@ -856,4 +865,175 @@ public class YarnClientImpl extends YarnClient {
         SignalContainerRequest.newInstance(containerId, command);
     rmClient.signalContainer(request);
   }
+  
+  public ClusterPressureEvent getClusterPressureEventStatus() {
+	  return clusterPressureEventStatus;
+  }
+
+  public void setClusterPressureEventStatus(ClusterPressureEvent clusterPressureEvent) {
+	  if(clusterPressureEvent.getType() == ClusterPressureEventType.NO_PRESSURE){
+		  LOG.info("No pressure, resetting clusterPressureEventStatus");
+		  this.clusterPressureEventStatus = clusterPressureEvent;
+	  }else{
+		  LOG.info("Setting pressure, num containers requested: " + clusterPressureEvent.requestedContainers);
+		  this.clusterPressureEventStatus = clusterPressureEvent;
+	  }
+  }
+
+  public class ClusterPressureMonitor extends AbstractService{
+
+		private ApplicationClientProtocol rmClient;
+		private YarnClient client;
+		private final Thread resourcePressureChecker;
+		private volatile boolean stopped = false;
+		private static final double PERCENT_RESOURCE_UTILIZATION = 1.0;
+		private static final long RESOURCE_PRESSURE_TIMEOUT_MS = 5000;
+		private static final long RESOURCE_PRESSURE_POLLING_INTERVAL_MS = 5000;
+		private static final String ROOT = "root";
+
+		public ClusterPressureMonitor(YarnClientImpl client, ApplicationClientProtocol rmClient) {
+			super("ClusterPressureMonitor");
+			this.client = client;
+			this.rmClient = rmClient;
+			resourcePressureChecker = new Thread(new ClusterPressureChecker());
+			resourcePressureChecker.setName("Cluster Pressure Monitor");
+		}
+
+		@Override
+		protected void serviceInit(Configuration conf) throws Exception {
+			super.serviceInit(conf);
+		}
+
+		@Override
+		protected void serviceStart() throws Exception {
+			this.resourcePressureChecker.start();
+			super.serviceStart();
+		}
+
+		@Override
+		protected void serviceStop() throws Exception {
+		    this.stopped = true;
+	        this.resourcePressureChecker.interrupt();
+	        try {
+	          this.resourcePressureChecker.join();
+	        } catch (InterruptedException e) {
+	          throw new YarnRuntimeException(e);
+	        }
+	        super.serviceStop();
+		}
+
+		private class ClusterPressureChecker implements Runnable {
+		      @Override
+		      public void run() {
+
+		        while (!stopped && !Thread.currentThread().isInterrupted()) {
+		        	
+		        	sleep(RESOURCE_PRESSURE_POLLING_INTERVAL_MS);
+		
+					//qMetrics = yarnScheduler.getRootQueueMetrics();
+		        	//GetClusterMetricsRequest request = Records.newRecord(GetClusterMetricsRequest.class);
+		            //GetClusterMetricsResponse response = rmClient.getClusterMetrics(request);
+		            //YarnClusterMetrics metrics = response.getClusterMetrics();
+		       
+		            // metric.
+		            List<QueueInfo> rootQueues = null;
+		            QueueInfo root = null;
+		            
+					try {
+						rootQueues = client.getRootQueueInfos();
+						root = client.getQueueInfo(ROOT);
+					} catch (Exception e) {
+						printLOG("Cannot get root queue infos");
+					}
+					
+					long allocatedMemory = -1;
+		            long pendingMemory = -1;
+		            long usedMemory = -1;
+		            long availableMemory = -1;
+		            long totalMemory = -1;
+		            
+					/*if(rootQueues != null){
+			            for(QueueInfo info : rootQueues){
+			            	QueueStatistics qStats = info.getQueueStatistics();
+			            	availableMemory = qStats.getAvailableMemoryMB();
+			            	allocatedMemory = qStats.getAllocatedMemoryMB();
+				            pendingMemory = qStats.getPendingMemoryMB();
+				            usedMemory = qStats.getReservedMemoryMB();
+				            totalMemory = allocatedMemory + availableMemory;
+				            printLOG("********************");
+							printLOG("Memory Stuff: Total Memory = " + totalMemory + ", Reserved Memory = " + usedMemory + ", Available Memory = " + availableMemory + ", Pending Memory = " + pendingMemory + ", Allocated Memory = " + allocatedMemory);
+							printLOG("********************");
+			            }
+					}else{
+						printLOG("Root Queues is null.");
+					}*/
+		          
+					int availableMem = -1;
+	            	int allocatedMem = -1;
+		            int pendingMem = -1;
+		            int usedMem = -1;
+		            int totalMem = -1;
+		            
+					if(rootQueues != null){
+						QueueStatistics qStats = root.getQueueStatistics();
+						availableMem = (int) qStats.getAvailableMemoryMB();
+		            	allocatedMem = (int) qStats.getAllocatedMemoryMB();
+			            pendingMem = (int) qStats.getPendingMemoryMB();
+			            usedMem = (int) qStats.getReservedMemoryMB();
+			            totalMem = allocatedMem + availableMem;
+					}else{
+						printLOG("Root Queues is null.");
+					}
+		            
+		            printLOG("********************");
+					printLOG("Memory Stuff: Total Memory = " + totalMem + ", Reserved Memory = " + usedMem + ", Available Memory = " + availableMem + ", Pending Memory = " + pendingMem + ", Allocated Memory = " + allocatedMem);
+					printLOG("********************");
+					
+					//if we get memory pressure, lets send out a cluster pressure notification.
+					if(checkPressure(availableMem, allocatedMem, pendingMem)){
+						((YarnClientImpl) client).setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.CLUSTER_PRESSURE));
+						sleep(RESOURCE_PRESSURE_TIMEOUT_MS);
+					}else{
+						((YarnClientImpl) client).setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.NO_PRESSURE));
+					}
+		        }
+		      }
+		      
+		      private void sleep(long timeInMS){
+		    	  try {
+		    		  Thread.sleep(timeInMS);
+		    	  } catch (InterruptedException e) {
+		    		 printLOG("Failed to sleep because interrupted.");
+		    	  }
+		      }
+		      
+		      private void printLOG(String msg){
+		    	  Log LOG = YarnClientImpl.LOG;
+		    	  LOG.info("[ClusterPressureMonitor] "+msg);
+		      }
+
+		      private boolean checkPressure(int availMem, int usedMem, int pendingMem){
+		    	  if(availMem < 0 || usedMem < 0 || pendingMem < 0){
+		    		  return false;
+		    	  }
+		    	  
+				  int totalMem = usedMem + availMem;
+				  float result = 0;
+				 
+				  if(totalMem > 0){
+					  result = (float)(usedMem + pendingMem)/totalMem;
+				  }else{
+					  result = 0;
+				  }
+		
+				  if(result > PERCENT_RESOURCE_UTILIZATION){
+					  return true;
+				  }else if(result < PERCENT_RESOURCE_UTILIZATION){
+					  return false;
+				  }else{
+					  return false;
+				  }
+		      }
+	    }
+	}
 }

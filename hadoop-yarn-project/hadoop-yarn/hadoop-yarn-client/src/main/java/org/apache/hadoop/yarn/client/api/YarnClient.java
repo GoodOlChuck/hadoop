@@ -61,6 +61,7 @@ import org.apache.hadoop.yarn.api.records.Token;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.api.records.YarnClusterMetrics;
 import org.apache.hadoop.yarn.client.api.impl.YarnClientImpl;
+import org.apache.hadoop.yarn.event.ClusterPressureEvent;
 import org.apache.hadoop.yarn.exceptions.ApplicationAttemptNotFoundException;
 import org.apache.hadoop.yarn.exceptions.ApplicationIdNotProvidedException;
 import org.apache.hadoop.yarn.exceptions.ApplicationNotFoundException;
@@ -760,4 +761,26 @@ public abstract class YarnClient extends AbstractService {
    */
   public abstract void signalContainer(ContainerId containerId,
       SignalContainerCommand command) throws YarnException, IOException;
+  
+  /**
+   * <p>
+   * Check if a ClusterPressureEvent has been triggered.
+   * </p>
+   *
+   * @return the cluster pressure event either of type ClusterPressureEventType.CLUSTER_PRESSURE or 
+   * 			ClusterPressureEventType.NO_PRESSURE.
+   */
+  public ClusterPressureEvent getClusterPressureEventStatus(){
+	  return null;
+  }
+
+  /**
+   * <p>
+   * Set the ClusterPressureEvent.
+   * </p>
+   *
+   */
+  public void setClusterPressureEventStatus(ClusterPressureEvent clusterPressureEvent){
+	  //do nothing
+  }
 }
