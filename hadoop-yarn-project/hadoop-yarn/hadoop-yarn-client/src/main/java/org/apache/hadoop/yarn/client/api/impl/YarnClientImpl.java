@@ -896,10 +896,12 @@ public class YarnClientImpl extends YarnClient {
 
   public void setClusterPressureEventStatus(ClusterPressureEvent clusterPressureEvent) {
 	  if(clusterPressureEvent.getType() == ClusterPressureEventType.NO_PRESSURE){
-		  LOG.info("No pressure, resetting clusterPressureEventStatus");
+		  if(DEBUG)
+			  LOG.info("No pressure, resetting clusterPressureEventStatus");
 		  this.clusterPressureEventStatus = clusterPressureEvent;
 	  }else{
-		  LOG.info("Setting pressure, num containers requested: " + clusterPressureEvent.requestedContainers);
+		  if(DEBUG)
+			  LOG.info("Setting pressure, num containers requested: " + clusterPressureEvent.requestedContainers);
 		  this.clusterPressureEventStatus = clusterPressureEvent;
 	  }
   }
