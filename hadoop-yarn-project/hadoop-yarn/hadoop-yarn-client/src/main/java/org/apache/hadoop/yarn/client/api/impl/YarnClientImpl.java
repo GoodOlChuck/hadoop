@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.yarn.client.api.impl;
 
+import java.awt.Container;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -108,6 +109,7 @@ import org.apache.hadoop.yarn.client.api.AHSClient;
 import org.apache.hadoop.yarn.client.api.TimelineClient;
 import org.apache.hadoop.yarn.client.api.YarnClient;
 import org.apache.hadoop.yarn.client.api.YarnClientApplication;
+import org.apache.hadoop.yarn.client.api.ContainerRequestPolicy;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.event.ClusterPressureEvent;
 import org.apache.hadoop.yarn.event.ClusterPressureEventType;
@@ -143,13 +145,26 @@ public class YarnClientImpl extends YarnClient {
   String timelineDTRenewer;
   protected boolean timelineServiceEnabled;
   protected boolean timelineServiceBestEffort;
+  private boolean pressureServiceEnabled;
   private ClusterPressureMonitor clusterPressureMonitor;
-  private ClusterPressureEvent clusterPressureEventStatus = null;
+  private ClusterPressureEvent clusterPressureEventStatus = new ClusterPressureEvent(ClusterPressureEventType.NO_PRESSURE);
+  private static ContainerRequestPolicy containerRequestPolicy;
+  private static final boolean DEBUG = false;
 
   private static final String ROOT = "root";
 
   public YarnClientImpl() {
     super(YarnClientImpl.class.getName());
+  }
+  
+  public YarnClientImpl(ContainerRequestPolicy policy) {
+	super(YarnClientImpl.class.getName());
+	this.pressureServiceEnabled = true;
+	if(policy == null){
+		containerRequestPolicy = ContainerRequestPolicy.ALL_CONTAINERS;
+	}else{
+		containerRequestPolicy = policy;
+	}
   }
 
   @SuppressWarnings("deprecation")
@@ -200,14 +215,16 @@ public class YarnClientImpl extends YarnClient {
     try {
       rmClient = ClientRMProxy.createRMProxy(getConfig(),
           ApplicationClientProtocol.class);
-      clusterPressureMonitor = new ClusterPressureMonitor(this, rmClient);
+      clusterPressureMonitor = new ClusterPressureMonitor(this);
       if (historyServiceEnabled) {
         historyClient.start();
       }
       if (timelineServiceEnabled) {
         timelineClient.start();
       }
-  	  clusterPressureMonitor.serviceStart();
+      if (pressureServiceEnabled) {
+    	clusterPressureMonitor.serviceStart();
+      }
     } catch (IOException e) {
       throw new YarnRuntimeException(e);
     }
@@ -225,7 +242,10 @@ public class YarnClientImpl extends YarnClient {
     if (timelineServiceEnabled) {
       timelineClient.stop();
     }
-    clusterPressureMonitor.serviceStop();
+    if(pressureServiceEnabled){
+	  clusterPressureMonitor.serviceStop();
+	  clusterPressureMonitor.stop();
+    }
     super.serviceStop();
   }
 
@@ -866,6 +886,10 @@ public class YarnClientImpl extends YarnClient {
     rmClient.signalContainer(request);
   }
   
+  protected ContainerRequestPolicy getContainerRequestPolicy(){
+	  return containerRequestPolicy;
+  }
+  
   public ClusterPressureEvent getClusterPressureEventStatus() {
 	  return clusterPressureEventStatus;
   }
@@ -882,7 +906,6 @@ public class YarnClientImpl extends YarnClient {
 
   public class ClusterPressureMonitor extends AbstractService{
 
-		private ApplicationClientProtocol rmClient;
 		private YarnClient client;
 		private final Thread resourcePressureChecker;
 		private volatile boolean stopped = false;
@@ -891,10 +914,9 @@ public class YarnClientImpl extends YarnClient {
 		private static final long RESOURCE_PRESSURE_POLLING_INTERVAL_MS = 5000;
 		private static final String ROOT = "root";
 
-		public ClusterPressureMonitor(YarnClientImpl client, ApplicationClientProtocol rmClient) {
+		public ClusterPressureMonitor(YarnClientImpl client) {
 			super("ClusterPressureMonitor");
 			this.client = client;
-			this.rmClient = rmClient;
 			resourcePressureChecker = new Thread(new ClusterPressureChecker());
 			resourcePressureChecker.setName("Cluster Pressure Monitor");
 		}
@@ -921,80 +943,101 @@ public class YarnClientImpl extends YarnClient {
 	        }
 	        super.serviceStop();
 		}
-
+	
 		private class ClusterPressureChecker implements Runnable {
 		      @Override
 		      public void run() {
-
+		    	boolean hadPressureTimeout = false;
 		        while (!stopped && !Thread.currentThread().isInterrupted()) {
+		        	if(hadPressureTimeout == false)
+		        		sleep(RESOURCE_PRESSURE_POLLING_INTERVAL_MS);
+		        	else
+		        		hadPressureTimeout = false;
 		        	
-		        	sleep(RESOURCE_PRESSURE_POLLING_INTERVAL_MS);
-		
-					//qMetrics = yarnScheduler.getRootQueueMetrics();
-		        	//GetClusterMetricsRequest request = Records.newRecord(GetClusterMetricsRequest.class);
-		            //GetClusterMetricsResponse response = rmClient.getClusterMetrics(request);
-		            //YarnClusterMetrics metrics = response.getClusterMetrics();
-		       
-		            // metric.
-		            List<QueueInfo> rootQueues = null;
 		            QueueInfo root = null;
 		            
 					try {
-						rootQueues = client.getRootQueueInfos();
 						root = client.getQueueInfo(ROOT);
 					} catch (Exception e) {
 						printLOG("Cannot get root queue infos");
 					}
 					
-					long allocatedMemory = -1;
-		            long pendingMemory = -1;
-		            long usedMemory = -1;
-		            long availableMemory = -1;
-		            long totalMemory = -1;
-		            
-					/*if(rootQueues != null){
-			            for(QueueInfo info : rootQueues){
-			            	QueueStatistics qStats = info.getQueueStatistics();
-			            	availableMemory = qStats.getAvailableMemoryMB();
-			            	allocatedMemory = qStats.getAllocatedMemoryMB();
-				            pendingMemory = qStats.getPendingMemoryMB();
-				            usedMemory = qStats.getReservedMemoryMB();
-				            totalMemory = allocatedMemory + availableMemory;
-				            printLOG("********************");
-							printLOG("Memory Stuff: Total Memory = " + totalMemory + ", Reserved Memory = " + usedMemory + ", Available Memory = " + availableMemory + ", Pending Memory = " + pendingMemory + ", Allocated Memory = " + allocatedMemory);
-							printLOG("********************");
-			            }
-					}else{
-						printLOG("Root Queues is null.");
-					}*/
-		          
 					int availableMem = -1;
 	            	int allocatedMem = -1;
 		            int pendingMem = -1;
 		            int usedMem = -1;
 		            int totalMem = -1;
+		            int allocatedContainers = -1;
+		            int pendingContainers = -1;
+		            int numApps = -1;
 		            
-					if(rootQueues != null){
+					if(root != null){
 						QueueStatistics qStats = root.getQueueStatistics();
 						availableMem = (int) qStats.getAvailableMemoryMB();
 		            	allocatedMem = (int) qStats.getAllocatedMemoryMB();
 			            pendingMem = (int) qStats.getPendingMemoryMB();
 			            usedMem = (int) qStats.getReservedMemoryMB();
+			            allocatedContainers = (int) qStats.getAllocatedContainers();
+			            pendingContainers = (int) qStats.getPendingContainers();
+			            numApps = root.getApplications().size();
 			            totalMem = allocatedMem + availableMem;
 					}else{
-						printLOG("Root Queues is null.");
+						printLOG("Root Queue is null.");
 					}
-		            
-		            printLOG("********************");
-					printLOG("Memory Stuff: Total Memory = " + totalMem + ", Reserved Memory = " + usedMem + ", Available Memory = " + availableMem + ", Pending Memory = " + pendingMem + ", Allocated Memory = " + allocatedMem);
-					printLOG("********************");
 					
-					//if we get memory pressure, lets send out a cluster pressure notification.
-					if(checkPressure(availableMem, allocatedMem, pendingMem)){
-						((YarnClientImpl) client).setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.CLUSTER_PRESSURE));
-						sleep(RESOURCE_PRESSURE_TIMEOUT_MS);
+					double memPerContainer = Double.NaN;
+					double totalContainers = Double.NaN;
+					double totalContainersCeiling = Double.NaN;
+					double neededContainers = Double.NaN;
+					double neededContainersCeiling = Double.NaN;
+					double neededMemory = Double.NaN;
+					double neededContainersDivided = Double.NaN;
+					
+					if(availableMem == -1 || allocatedMem == -1 || pendingMem == -1 || usedMem == -1 || totalMem == -1 || allocatedContainers == -1 || 
+							pendingContainers == -1 || numApps == -1){
+						debugLOG("Metrics not set.");
+						debugLOG("Container Info: pendingContainers " + pendingContainers + ", allocatedContainers " + allocatedContainers);
 					}else{
-						((YarnClientImpl) client).setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.NO_PRESSURE));
+						debugLOG("Container Info: pendingContainers " + pendingContainers + ", allocatedContainers " + allocatedContainers);
+						if(allocatedContainers > 0 && allocatedMem > 0)
+							memPerContainer = (double) allocatedMem/allocatedContainers;
+						if(memPerContainer > 0 && totalMem > 0){
+							debugLOG("We got here.");
+							totalContainers = (double) totalMem/ (double) memPerContainer;
+							totalContainersCeiling = Math.ceil(totalContainers);
+							neededContainers = Math.abs(totalContainers - pendingContainers - allocatedContainers);
+							neededContainersCeiling = Math.ceil(neededContainers);
+							neededMemory = Math.abs(totalMem - pendingMem - allocatedMem);
+							double divided = (double) neededContainersCeiling/numApps;
+							neededContainersDivided = Math.ceil(divided);
+						}else{
+							debugLOG("totalMem or memPerContainer not greater than zero. totalMem = " + totalMem + ", memPerContainer = " + memPerContainer);
+						}
+					}
+					debugLOG("Memory Info (int values): Total Memory = " + totalMem + ", Reserved Memory = " + usedMem + ", Available Memory = " + 
+					availableMem + ", Pending Memory = " + pendingMem + ", Allocated Memory = " + allocatedMem);
+					if(!Double.isNaN(memPerContainer) && !Double.isNaN(totalContainers) && !Double.isNaN(totalContainersCeiling) && 
+							!Double.isNaN(neededContainers) && !Double.isNaN(neededContainersCeiling) && !Double.isNaN(neededMemory) && 
+							!Double.isNaN(neededContainersDivided)){
+						debugLOG("Testing: totalContainers = " + totalContainers + ", neededContainers = " + neededContainers + ", neededMemory = " + neededMemory + ", totalContainersCeiling = " + totalContainersCeiling + 
+								", memPerContainer = " + memPerContainer + ", neededContainersCeiling = " + neededContainersCeiling + ", neededContainersDivided = " + neededContainersDivided + ", numApps = " + numApps);
+						//if we get memory pressure, lets send out a cluster pressure notification.
+						if(checkPressure(availableMem, allocatedMem, pendingMem)){
+							if(containerRequestPolicy == ContainerRequestPolicy.ALL_CONTAINERS)
+								client.setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.CLUSTER_PRESSURE));
+							else if(containerRequestPolicy == ContainerRequestPolicy.NEEDED_CONTAINERS)
+								client.setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.CLUSTER_PRESSURE, (int) neededContainersCeiling));
+							else if(containerRequestPolicy == ContainerRequestPolicy.EVEN_NEEDED_CONTAINERS)
+								client.setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.CLUSTER_PRESSURE, (int) neededContainersDivided));
+							else
+								printLOG("Invalid ContainerRequestPolicy");
+							sleep(RESOURCE_PRESSURE_TIMEOUT_MS);
+							hadPressureTimeout = true;
+						}else{
+							client.setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.NO_PRESSURE));
+						}
+					}else{
+						debugLOG("Containers calculations are NaN.");
 					}
 		        }
 		      }
@@ -1007,9 +1050,16 @@ public class YarnClientImpl extends YarnClient {
 		    	  }
 		      }
 		      
+		      private void debugLOG(String msg){
+		    	  if(DEBUG){
+			    	  Log LOG = YarnClientImpl.LOG;
+			    	  LOG.info("[ClusterPressureMonitor] "+ msg);
+		    	  }
+		      }
+		      
 		      private void printLOG(String msg){
 		    	  Log LOG = YarnClientImpl.LOG;
-		    	  LOG.info("[ClusterPressureMonitor] "+msg);
+		    	  LOG.info("[ClusterPressureMonitor] "+ msg);
 		      }
 
 		      private boolean checkPressure(int availMem, int usedMem, int pendingMem){
@@ -1026,13 +1076,7 @@ public class YarnClientImpl extends YarnClient {
 					  result = 0;
 				  }
 		
-				  if(result > PERCENT_RESOURCE_UTILIZATION){
-					  return true;
-				  }else if(result < PERCENT_RESOURCE_UTILIZATION){
-					  return false;
-				  }else{
-					  return false;
-				  }
+				  return result > PERCENT_RESOURCE_UTILIZATION;
 		      }
 	    }
 	}

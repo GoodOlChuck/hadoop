@@ -81,6 +81,17 @@ public abstract class YarnClient extends AbstractService {
     YarnClient client = new YarnClientImpl();
     return client;
   }
+  
+  /**
+   * Create a new instance of YarnClient with ClusterPressureService enabled.
+   * @param policy - ContainerRequestPolicy for requesting containers from Client applications. 
+   * Available Policies - (ALL_CONTAINERS, NEEDED_CONTAINERS, EVEN_NEEDED_CONTAINERS)
+   */
+  @Public
+  public static YarnClient createYarnClient(ContainerRequestPolicy policy) {
+    YarnClient client = new YarnClientImpl(policy);
+    return client;
+  }
 
   @Private
   protected YarnClient(String name) {

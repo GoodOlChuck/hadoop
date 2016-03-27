@@ -2,7 +2,7 @@ package org.apache.hadoop.yarn.event;
 
 public class ClusterPressureEvent extends AbstractEvent<ClusterPressureEventType>{
 
-	public int requestedContainers,numApps;
+	public int requestedContainers;
 
 	public ClusterPressureEvent(ClusterPressureEventType type){
 		super(type);
@@ -20,7 +20,6 @@ public class ClusterPressureEvent extends AbstractEvent<ClusterPressureEventType
 		else{
 			this.requestedContainers = numContainers;
 		}
-		this.numApps = numApps;
 	}
 
 	@Override
