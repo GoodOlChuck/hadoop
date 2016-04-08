@@ -42,6 +42,7 @@ import java.util.Map;
 import java.util.Set;
 
 import org.apache.commons.io.IOUtils;
+import org.apache.commons.logging.Log;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.DataInputByteBuffer;
 import org.apache.hadoop.io.DataOutputBuffer;
@@ -52,6 +53,7 @@ import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.TokenIdentifier;
+import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportResponse;
@@ -94,6 +96,8 @@ import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeLabel;
 import org.apache.hadoop.yarn.api.records.Priority;
+import org.apache.hadoop.yarn.api.records.QueueInfo;
+import org.apache.hadoop.yarn.api.records.QueueStatistics;
 import org.apache.hadoop.yarn.api.records.ReservationDefinition;
 import org.apache.hadoop.yarn.api.records.ReservationId;
 import org.apache.hadoop.yarn.api.records.ReservationRequest;
@@ -104,14 +108,19 @@ import org.apache.hadoop.yarn.api.records.SignalContainerCommand;
 import org.apache.hadoop.yarn.api.records.YarnApplicationAttemptState;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.client.api.AHSClient;
+import org.apache.hadoop.yarn.client.api.ContainerRequestPolicy;
 import org.apache.hadoop.yarn.client.api.TimelineClient;
 import org.apache.hadoop.yarn.client.api.YarnClient;
 import org.apache.hadoop.yarn.client.api.YarnClientApplication;
+//import org.apache.hadoop.yarn.client.api.impl.YarnClientImpl.ClusterPressureMonitor.ClusterPressureChecker;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.event.ClusterPressureEvent;
+import org.apache.hadoop.yarn.event.ClusterPressureEventType;
 import org.apache.hadoop.yarn.exceptions.ApplicationIdNotProvidedException;
 import org.apache.hadoop.yarn.exceptions.ApplicationNotFoundException;
 import org.apache.hadoop.yarn.exceptions.ContainerNotFoundException;
 import org.apache.hadoop.yarn.exceptions.YarnException;
+import org.apache.hadoop.yarn.exceptions.YarnRuntimeException;
 import org.apache.hadoop.yarn.security.client.TimelineDelegationTokenIdentifier;
 import org.apache.hadoop.yarn.server.MiniYARNCluster;
 import org.apache.hadoop.yarn.server.resourcemanager.MockRM;
@@ -508,8 +517,204 @@ public class TestYarnClient {
     client.close();
   }
 
-  private static class MockYarnClient extends YarnClientImpl {
+  public class MockQueueStatistics{
+	  private int availableMemory = 0, allocatedMemory = 0, pendingMemory = 0, numApps = 0;
+	  private int allocatedContainers = 0, pendingContainers = 0;
+	  public MockQueueStatistics(int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers){
+		  this.availableMemory = availableMemory;
+		  this.allocatedMemory = allocatedMemory;
+		  this.pendingMemory = pendingMemory;
+		  this.numApps = numApps;
+		  this.allocatedContainers = allocatedContainers;
+		  this.pendingContainers = pendingContainers;
+	  }
+      public int getAvailableMemory() {
+    	  return availableMemory;
+	  }
+	  public int getAllocatedMemory() {
+		  return allocatedMemory;
+	  }
+	  public int getPendingMemory() {
+		  return pendingMemory;
+	  }
+	  public int getNumApps() {
+		  return numApps;
+	  }
+	  public int getAllocatedContainers() {
+	      return allocatedContainers;
+	  }
+	  public int getPendingContainers() {
+		  return pendingContainers;
+	  }
+	  
+  }
+  
+  public class MockClusterPressureMonitor extends AbstractService{
 
+		private MockPressureYarnClient client;
+		private final Thread resourcePressureChecker;
+		private volatile boolean stopped = false;
+		private static final double PERCENT_RESOURCE_UTILIZATION = 1.0;
+		private static final long RESOURCE_PRESSURE_TIMEOUT_MS = 5000;
+		//Set to half a second for testing
+		private static final long RESOURCE_PRESSURE_POLLING_INTERVAL_MS = 500;
+		private static final String ROOT = "root";
+		private ContainerRequestPolicy containerRequestPolicy;
+
+		public MockClusterPressureMonitor(MockPressureYarnClient client, ContainerRequestPolicy p) {
+			super("MockClusterPressureMonitor");
+			this.client = client;
+			resourcePressureChecker = new Thread(new MockClusterPressureChecker());
+			resourcePressureChecker.setName("Mock Cluster Pressure Monitor");
+			if(p == null){
+				containerRequestPolicy = ContainerRequestPolicy.ALL_CONTAINERS;
+			}else{
+				containerRequestPolicy = p;
+			}
+		}
+
+		@Override
+		protected void serviceInit(Configuration conf) throws Exception {
+			super.serviceInit(conf);
+		}
+
+		@Override
+		protected void serviceStart() throws Exception {
+			this.resourcePressureChecker.start();
+			super.serviceStart();
+		}
+
+		@Override
+		protected void serviceStop() throws Exception {
+		    this.stopped = true;
+	        this.resourcePressureChecker.interrupt();
+	        try {
+	          this.resourcePressureChecker.join();
+	        } catch (InterruptedException e) {
+	          throw new YarnRuntimeException(e);
+	        }
+	        super.serviceStop();
+		}
+	
+		private class MockClusterPressureChecker implements Runnable {
+		      @Override
+		      public void run() {
+		    	boolean hadPressureTimeout = false;
+		        while (!stopped && !Thread.currentThread().isInterrupted()) {
+		        	if(hadPressureTimeout == false)
+		        		sleep(RESOURCE_PRESSURE_POLLING_INTERVAL_MS);
+		        	else
+		        		hadPressureTimeout = false;
+		        	
+					MockQueueStatistics qStats = client.getQueueStatistics();
+					int availableMem = (int) qStats.getAvailableMemory();
+	            	int allocatedMem = (int) qStats.getAllocatedMemory();
+		            int pendingMem = (int) qStats.getPendingMemory();
+		            int allocatedContainers = (int) qStats.getAllocatedContainers();
+		            int pendingContainers = (int) qStats.getPendingContainers();
+		            int numApps = qStats.getNumApps();
+			
+		            int totalMem = allocatedMem + availableMem;
+					
+					double memPerContainer = Double.NaN;
+					double totalContainers = Double.NaN;
+					double totalContainersCeiling = Double.NaN;
+					double neededContainers = Double.NaN;
+					double neededContainersCeiling = Double.NaN;
+					double neededMemory = Double.NaN;
+					double neededContainersDivided = Double.NaN;
+					
+					if(availableMem == -1 || allocatedMem == -1 || pendingMem == -1 || totalMem == -1 || allocatedContainers == -1 || 
+							pendingContainers == -1 || numApps == -1){
+						debugLOG("Metrics not set.");
+						debugLOG("Container Info: pendingContainers " + pendingContainers + ", allocatedContainers " + allocatedContainers);
+					}else{
+						debugLOG("Container Info: pendingContainers " + pendingContainers + ", allocatedContainers " + allocatedContainers);
+						if(allocatedContainers > 0 && allocatedMem > 0)
+							memPerContainer = (double) allocatedMem/allocatedContainers;
+						if(memPerContainer > 0 && totalMem > 0){
+							debugLOG("We got here.");
+							totalContainers = (double) totalMem/ (double) memPerContainer;
+							totalContainersCeiling = Math.ceil(totalContainers);
+							neededContainers = Math.abs(totalContainers - pendingContainers - allocatedContainers);
+							neededContainersCeiling = Math.ceil(neededContainers);
+							neededMemory = Math.abs(totalMem - pendingMem - allocatedMem);
+							double divided = (double) neededContainersCeiling/numApps;
+							neededContainersDivided = Math.ceil(divided);
+						}else{
+							debugLOG("totalMem or memPerContainer not greater than zero. totalMem = " + totalMem + ", memPerContainer = " + memPerContainer);
+						}
+					}
+					debugLOG("Memory Info (int values): Total Memory = " + totalMem + ", Available Memory = " + 
+					availableMem + ", Pending Memory = " + pendingMem + ", Allocated Memory = " + allocatedMem);
+					if(!Double.isNaN(memPerContainer) && !Double.isNaN(totalContainers) && !Double.isNaN(totalContainersCeiling) && 
+							!Double.isNaN(neededContainers) && !Double.isNaN(neededContainersCeiling) && !Double.isNaN(neededMemory) && 
+							!Double.isNaN(neededContainersDivided)){
+						debugLOG("Testing: totalContainers = " + totalContainers + ", neededContainers = " + neededContainers + ", neededMemory = " + neededMemory + ", totalContainersCeiling = " + totalContainersCeiling + 
+								", memPerContainer = " + memPerContainer + ", neededContainersCeiling = " + neededContainersCeiling + ", neededContainersDivided = " + neededContainersDivided + ", numApps = " + numApps);
+						//if we get memory pressure, lets send out a cluster pressure notification.
+						if(checkPressure(availableMem, allocatedMem, pendingMem)){
+							if(containerRequestPolicy == ContainerRequestPolicy.ALL_CONTAINERS)
+								client.setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.CLUSTER_PRESSURE));
+							else if(containerRequestPolicy == ContainerRequestPolicy.NEEDED_CONTAINERS)
+								client.setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.CLUSTER_PRESSURE, (int) neededContainersCeiling));
+							else if(containerRequestPolicy == ContainerRequestPolicy.EVEN_NEEDED_CONTAINERS)
+								client.setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.CLUSTER_PRESSURE, (int) neededContainersDivided));
+							else
+								printLOG("Invalid ContainerRequestPolicy");
+							sleep(RESOURCE_PRESSURE_TIMEOUT_MS);
+							hadPressureTimeout = true;
+						}else{
+							client.setClusterPressureEventStatus(new ClusterPressureEvent(ClusterPressureEventType.NO_PRESSURE));
+						}
+					}else{
+						debugLOG("Containers calculations are NaN.");
+					}
+		        }
+		      }
+		      
+		      private void sleep(long timeInMS){
+		    	  try {
+		    		  Thread.sleep(timeInMS);
+		    	  } catch (InterruptedException e) {
+		    		 printLOG("Failed to sleep because interrupted.");
+		    	  }
+		      }
+		      
+		      private void debugLOG(String msg){
+		    	  if(false){
+			    	  Log LOG = YarnClientImpl.LOG;
+			    	  LOG.info("[ClusterPressureMonitor] "+ msg);
+		    	  }
+		      }
+		      
+		      private void printLOG(String msg){
+		    	  Log LOG = YarnClientImpl.LOG;
+		    	  LOG.info("[ClusterPressureMonitor] "+ msg);
+		      }
+
+		      private boolean checkPressure(int availMem, int usedMem, int pendingMem){
+		    	  if(availMem < 0 || usedMem < 0 || pendingMem < 0){
+		    		  return false;
+		    	  }
+		    	  
+				  int totalMem = usedMem + availMem;
+				  double result = 0;
+				 
+				  if(totalMem > 0){
+					  result = (double)(usedMem + pendingMem)/totalMem;
+				  }else{
+					  result = 0;
+				  }
+		
+				  return result > PERCENT_RESOURCE_UTILIZATION;
+		      }
+	    }
+	}
+
+  private static class MockYarnClient extends YarnClientImpl {
+	  
     private ApplicationReport mockReport;
     private List<ApplicationReport> reports;
     private HashMap<ApplicationId, List<ApplicationAttemptReport>> attempts = 
@@ -533,7 +738,7 @@ public class TestYarnClient {
       mock(GetLabelsToNodesResponse.class);
     GetNodesToLabelsResponse mockNodeToLabelsResponse =
         mock(GetNodesToLabelsResponse.class);
-
+    
     public MockYarnClient() {
       super();
       reports = createAppReports();
@@ -885,6 +1090,31 @@ public class TestYarnClient {
       }
       throw new ContainerNotFoundException(containerId + " is not found ");
     }
+  }
+  
+  public class MockPressureYarnClient extends YarnClientImpl{
+	  private ClusterPressureEvent clusterPressureEventStatus = new ClusterPressureEvent(ClusterPressureEventType.NO_PRESSURE);
+	  private MockQueueStatistics queueStats;
+	  
+	  public ClusterPressureEvent getClusterPressureEventStatus() {
+	  	  return clusterPressureEventStatus;
+	  }
+	  
+	  public void setClusterPressureEventStatus(ClusterPressureEvent clusterPressureEvent) {
+	  	  if(clusterPressureEvent.getType() == ClusterPressureEventType.NO_PRESSURE){
+	  		  this.clusterPressureEventStatus = clusterPressureEvent;
+	  	  }else{
+	  		  this.clusterPressureEventStatus = clusterPressureEvent;
+	  	  }
+	  }
+	  
+	  public synchronized void setQueueStatistics(MockQueueStatistics qStats){
+	      queueStats = qStats;
+	  }
+	    
+	  public synchronized MockQueueStatistics getQueueStatistics(){
+	     return queueStats;
+	  }  
   }
 
   @Test(timeout = 30000)
@@ -1496,5 +1726,121 @@ public class TestYarnClient {
     SignalContainerRequest request = signalReqCaptor.getValue();
     Assert.assertEquals(containerId, request.getContainerId());
     Assert.assertEquals(command, request.getCommand());
+  }
+  
+  @Test
+  public void testNegativeValuesForQueueStatistics() throws Exception{
+	  MockPressureYarnClient client = new MockPressureYarnClient();
+	  MockClusterPressureMonitor clusterPressure = new MockClusterPressureMonitor(client, ContainerRequestPolicy.ALL_CONTAINERS);
+	  clusterPressure.serviceStart();
+	  /*
+	   * int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers
+	   */
+	  client.setQueueStatistics(new MockQueueStatistics(-1, -1, -1, -1, -1, -1));
+	  Thread.sleep(5000);
+	  Assert.assertEquals(ClusterPressureEventType.NO_PRESSURE, client.getClusterPressureEventStatus().getType());
+  }
+  
+  @Test
+  public void testNoPressure() throws Exception{
+	  MockPressureYarnClient client = new MockPressureYarnClient();
+	  MockClusterPressureMonitor clusterPressure = new MockClusterPressureMonitor(client, ContainerRequestPolicy.ALL_CONTAINERS);
+	  clusterPressure.serviceStart();
+	  /*
+	   * int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers
+	   */
+	  client.setQueueStatistics(new MockQueueStatistics(1024, 7168, 0, 2, 7, 0));
+	  Thread.sleep(5000);
+	  Assert.assertEquals(ClusterPressureEventType.NO_PRESSURE, client.getClusterPressureEventStatus().getType());
+  }
+  
+  @Test
+  public void testYesPressure() throws Exception{
+	  MockPressureYarnClient client = new MockPressureYarnClient();
+	  MockClusterPressureMonitor clusterPressure = new MockClusterPressureMonitor(client, ContainerRequestPolicy.ALL_CONTAINERS);
+	  clusterPressure.serviceStart();
+	  /*
+	   * int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers
+	   */
+	  client.setQueueStatistics(new MockQueueStatistics(1024, 7168, 2048, 2, 7, 2));
+	  Thread.sleep(5000);
+	  Assert.assertEquals(ClusterPressureEventType.CLUSTER_PRESSURE, client.getClusterPressureEventStatus().getType());
+  }
+  
+  @Test
+  public void testPressureOnOff() throws Exception{
+	  MockPressureYarnClient client = new MockPressureYarnClient();
+	  MockClusterPressureMonitor clusterPressure = new MockClusterPressureMonitor(client, ContainerRequestPolicy.ALL_CONTAINERS);
+	  clusterPressure.serviceStart();
+	  /*
+	   * int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers
+	   */
+	  client.setQueueStatistics(new MockQueueStatistics(1024, 7168, 2048, 2, 7, 2));
+	  Thread.sleep(5000);
+	  Assert.assertEquals(ClusterPressureEventType.CLUSTER_PRESSURE, client.getClusterPressureEventStatus().getType());
+	  client.setQueueStatistics(new MockQueueStatistics(1024, 7168, 0, 2, 7, 0));
+	  Thread.sleep(5000);
+	  Assert.assertEquals(ClusterPressureEventType.NO_PRESSURE, client.getClusterPressureEventStatus().getType());
+  }
+  
+  @Test
+  public void testPressureServiceStopped() throws Exception{
+	  MockPressureYarnClient client = new MockPressureYarnClient();
+	  MockClusterPressureMonitor clusterPressure = new MockClusterPressureMonitor(client, ContainerRequestPolicy.ALL_CONTAINERS);
+	  clusterPressure.serviceStart();
+	  /*
+	   * int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers
+	   */
+	  clusterPressure.serviceStop();
+	  Thread.sleep(5000);
+	  Assert.assertEquals(false, clusterPressure.resourcePressureChecker.isAlive());
+	  Assert.assertEquals(true, clusterPressure.stopped);
+  }
+  
+  @Test
+  public void testPressurePolicyRequestAll() throws Exception{
+	  MockPressureYarnClient client = new MockPressureYarnClient();
+	  MockClusterPressureMonitor clusterPressure = new MockClusterPressureMonitor(client, ContainerRequestPolicy.ALL_CONTAINERS);
+	  clusterPressure.serviceStart();
+	  /*
+	   * int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers
+	   */
+	  client.setQueueStatistics(new MockQueueStatistics(1024, 7168, 2048, 2, 7, 2));
+	  Thread.sleep(5000);
+	  Assert.assertEquals(Integer.MAX_VALUE,client.getClusterPressureEventStatus().requestedContainers);
+  }
+  
+  @Test
+  public void testPressurePolicyNeeded() throws Exception{
+	  MockPressureYarnClient client = new MockPressureYarnClient();
+	  MockClusterPressureMonitor clusterPressure = new MockClusterPressureMonitor(client, ContainerRequestPolicy.NEEDED_CONTAINERS);
+	  clusterPressure.serviceStart();
+	  /*
+	   * int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers
+	   */
+	  client.setQueueStatistics(new MockQueueStatistics(1024, 7168, 2048, 2, 7, 2));
+	  Thread.sleep(5000);
+	  Assert.assertEquals(1,client.getClusterPressureEventStatus().requestedContainers);
+  }
+  
+  @Test
+  public void testPressurePolicyEven() throws Exception{
+	  MockPressureYarnClient client = new MockPressureYarnClient();
+	  MockClusterPressureMonitor clusterPressure = new MockClusterPressureMonitor(client, ContainerRequestPolicy.EVEN_NEEDED_CONTAINERS);
+	  clusterPressure.serviceStart();
+	  /*
+	   * int availableMemory, int allocatedMemory, int pendingMemory, int numApps, 
+			  int allocatedContainers, int pendingContainers
+	   */
+	  client.setQueueStatistics(new MockQueueStatistics(1024, 7168, 3072, 2, 7, 3));
+	  Thread.sleep(5000);
+	  Assert.assertEquals(1,client.getClusterPressureEventStatus().requestedContainers);
   }
 }

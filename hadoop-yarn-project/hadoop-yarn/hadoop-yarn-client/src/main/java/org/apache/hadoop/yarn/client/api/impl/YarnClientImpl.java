@@ -155,6 +155,8 @@ public class YarnClientImpl extends YarnClient {
 
   public YarnClientImpl() {
     super(YarnClientImpl.class.getName());
+    this.pressureServiceEnabled = true;
+    containerRequestPolicy = ContainerRequestPolicy.ALL_CONTAINERS;
   }
   
   public YarnClientImpl(ContainerRequestPolicy policy) {
@@ -166,7 +168,7 @@ public class YarnClientImpl extends YarnClient {
 		containerRequestPolicy = policy;
 	}
   }
-
+  
   @SuppressWarnings("deprecation")
   @Override
   protected void serviceInit(Configuration conf) throws Exception {
@@ -905,7 +907,7 @@ public class YarnClientImpl extends YarnClient {
 		  this.clusterPressureEventStatus = clusterPressureEvent;
 	  }
   }
-
+  
   public class ClusterPressureMonitor extends AbstractService{
 
 		private YarnClient client;
@@ -1070,10 +1072,10 @@ public class YarnClientImpl extends YarnClient {
 		    	  }
 		    	  
 				  int totalMem = usedMem + availMem;
-				  float result = 0;
+				  double result = 0;
 				 
 				  if(totalMem > 0){
-					  result = (float)(usedMem + pendingMem)/totalMem;
+					  result = (double)(usedMem + (pendingMem))/totalMem;
 				  }else{
 					  result = 0;
 				  }
